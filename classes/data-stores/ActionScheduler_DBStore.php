@@ -1073,7 +1073,16 @@ AND `group_id` = %d
 	public function get_claim_count() {
 		global $wpdb;
 
-		$sql = "SELECT COUNT(DISTINCT claim_id) FROM {$wpdb->actionscheduler_actions} WHERE claim_id != 0 AND status IN ( %s, %s)";
+		$sql = "
+			SELECT COUNT(*)
+			FROM {$wpdb->actionscheduler_claims} c
+			WHERE EXISTS (
+				SELECT 1
+				FROM {$wpdb->actionscheduler_actions} a
+				WHERE a.claim_id = c.claim_id
+				AND a.status IN ( %s, %s )
+			)
+		";
 		$sql = $wpdb->prepare( $sql, array( self::STATUS_PENDING, self::STATUS_RUNNING ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 
 		return (int) $wpdb->get_var( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
