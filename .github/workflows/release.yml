@@ -108,7 +108,10 @@ jobs:
             }
             if (titles.length === 0) titles = ['Maintenance release.'];
 
-            const bullets = titles.map(t => `* ${t}`).join('\n');
+            const bullets = titles
+              .map(t => t.trim())
+              .map(t => `* ${t.endsWith('.') ? t : `${t}.`}`)
+              .join('\n');
             fs.writeFileSync(`${process.env.RUNNER_TEMP}/changelog-entries.txt`, bullets + '\n');
             core.info(`Changelog entries:\n${bullets}`);
 
@@ -119,7 +122,8 @@ jobs:
         run: |
           set -euo pipefail
           bullets=$(cat "${RUNNER_TEMP}/changelog-entries.txt")
-          # Real date: the action flow requires a valid date (woorelease won't fill a placeholder).
+          # We own the changelog: woorelease runs with --generate_changelog and won't touch it,
+          # so stamp the final date here.
           entry=$(printf '= %s - %s =\n%s' "${VERSION}" "$(date -u +%F)" "$bullets")
           hdr=$(grep -n '^== Changelog ==' readme.txt | head -1 | cut -d: -f1)
           {
@@ -150,7 +154,7 @@ jobs:
           phar="../woo-product-deploy/woorelease.phar"
           url="https://github.com/${{ github.repository }}/tree/trunk"
           php "$phar" vb:replace "$url" --folder="$PWD" --product_version="${VERSION}"
-          php "$phar" vb:change  "$url" --folder="$PWD" --product_version="${VERSION}"
+          php "$phar" vb:change  "$url" --folder="$PWD" --product_version="${VERSION}" --generate_changelog
           echo "=== Changes that would be made (changelog + version bump) ==="
           git --no-pager diff
 
@@ -187,9 +191,11 @@ jobs:
           # --release) commits and pushes them to the prep branch:
           #   vb:replace -> WRCS/loader version tokens (no commit; folded into the next commit)
           #   vb:change  -> plugin header version, stable tag, package.json
+          # --generate_changelog tells vb:change to leave the changelog alone (we manage it in readme.txt);
+          # without it woorelease expects a placeholder-date entry to stamp and errors out.
           url="https://github.com/${repo}/tree/${prep}"
           php "$phar" vb:replace "$url" --folder="$PWD" --product_version="${VERSION}"
-          php "$phar" vb:change  "$url" --folder="$PWD" --product_version="${VERSION}" --release
+          php "$phar" vb:change  "$url" --folder="$PWD" --product_version="${VERSION}" --release --generate_changelog
 
           # Open the prep PR into the release branch, with a checklist of things to verify.
           body=$(cat <<EOF
@@ -202,8 +208,10 @@ jobs:
           - [ ] \`Tested up to\` updated to the current WordPress version
           EOF
           )
-          gh pr create --repo "$repo" --base "$release" --head "$prep" \
-            --title "Release prep: ${VERSION}" --body "$body"
+          pr_url=$(gh pr create --repo "$repo" --base "$release" --head "$prep" \
+            --title "Release prep: ${VERSION}" --body "$body")
+          echo "Opened release prep PR: ${pr_url}"
+          echo "**Release prep PR for ${VERSION}:** ${pr_url}" >> "$GITHUB_STEP_SUMMARY"
 
   release:
     if: ${{ inputs.step == 'release' }}
@@ -250,42 +258,27 @@ jobs:
           path: ./.github/actions/woo-product-deploy
           token: ${{ secrets.ORG_DEPLOY_SECRET }}
 
-      - name: Deploy
-        uses: ./.github/actions/woo-product-deploy
-        with:
-          repo_url: ${{ github.server_url }}/${{ github.repository }}
-          branch: release/${{ inputs.version }}
-          version: ${{ inputs.version }}
-          node_version: '20'
-          npm_version: '10'
-          simulate: ${{ inputs.simulate }}
-          # Action Scheduler always releases to both targets, so these aren't exposed as toggles.
-          wporg_release: true
-          github_release: true
-          # Action Scheduler is not a WooCommerce.com marketplace product.
-          wccom_release: false
-          deploy_pat: ${{ secrets.ORG_DEPLOY_SECRET }}
-          wporg_username: ${{ secrets.WPORG_SVN_USERNAME }}
-          wporg_password: ${{ secrets.WPORG_SVN_PASSWORD }}
-
-      # Copy the new readme.txt changelog entry into changelog.txt on the release branch (so the
-      # list is only edited once, in readme.txt), and bring it to trunk via the merge-back PR.
-      - name: Checkout release branch
-        if: ${{ !inputs.simulate && success() }}
-        continue-on-error: true
+      # Check out the release branch so changelog.txt can be synced into the package before deploy.
+      - name: Check out the plugin
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: release/${{ inputs.version }}
           token: ${{ github.token }}
-          path: release-checkout
+          path: plugin
 
-      - name: Sync changelog.txt on the release branch
-        if: ${{ !inputs.simulate && success() }}
-        continue-on-error: true
-        working-directory: release-checkout
+      # Copy the new readme.txt changelog entry into changelog.txt (the list is edited once, in
+      # readme.txt) so the built package and the SVN upload carry it. For a real release, push it to
+      # the release branch (which the action then deploys); the dry run builds from this working copy.
+      - name: Sync changelog.txt
+        working-directory: plugin
         run: |
           set -euo pipefail
           version="${{ inputs.version }}"
+
+          if grep -qE "^= ${version} " changelog.txt; then
+            echo "changelog.txt already lists ${version}; nothing to sync."
+            exit 0
+          fi
 
           # The ${version} changelog entry from readme.txt (the "= ${version} - ... =" section).
           entry=$(awk -v v="= ${version} " '
@@ -299,11 +292,83 @@ jobs:
           { head -n 1 changelog.txt; echo; printf '%s\n\n' "$entry"; tail -n +2 changelog.txt | sed '1{/^$/d;}'; } > changelog.txt.new
           mv changelog.txt.new changelog.txt
 
+          # Commit so the build (which archives from git) includes it; push only for a real release,
+          # so the action deploys the updated branch. The dry run keeps the commit local.
           git config user.name "botwoo"
           git config user.email "botwoo@users.noreply.github.com"
           git add changelog.txt
           git commit -m "Update changelog.txt for ${version}"
-          git push origin "HEAD:release/${version}"
+          if [ "${{ inputs.simulate }}" != "true" ]; then
+            git push origin "HEAD:release/${version}"
+          fi
+
+      - name: Deploy
+        if: ${{ !inputs.simulate }}
+        uses: ./.github/actions/woo-product-deploy
+        with:
+          repo_url: ${{ github.server_url }}/${{ github.repository }}
+          branch: release/${{ inputs.version }}
+          version: ${{ inputs.version }}
+          node_version: '20'
+          npm_version: '10'
+          simulate: false
+          # Action Scheduler always releases to both targets, so these aren't exposed as toggles.
+          wporg_release: true
+          github_release: true
+          # Action Scheduler is not a WooCommerce.com marketplace product.
+          wccom_release: false
+          deploy_pat: ${{ secrets.ORG_DEPLOY_SECRET }}
+          wporg_username: ${{ secrets.WPORG_SVN_USERNAME }}
+          wporg_password: ${{ secrets.WPORG_SVN_PASSWORD }}
+
+      # TEMPORARY: the action's simulate runs woorelease's full `release` orchestrator, whose vb:change
+      # errors (#39) on our changelog.txt (no placeholder-date entry to stamp). The real deploy uses
+      # wporg:release directly, so we dry-run just that. Remove once woo-product-deploy does the same.
+      - name: "Dry-run deploy: set up PHP"
+        if: ${{ inputs.simulate }}
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.4'
+          extensions: posix, curl, mbstring, xml, zip, phar, openssl
+
+      - name: "Dry-run deploy: set up Node"
+        if: ${{ inputs.simulate }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+
+      # woorelease's wporg:release checks GitHub push permission upfront, which github.token (the
+      # github-actions bot) fails, so use the botwoo PAT here as the real deploy does.
+      - name: "Dry-run deploy: set up woorelease"
+        if: ${{ inputs.simulate }}
+        working-directory: .github/actions/woo-product-deploy
+        run: |
+          set -euo pipefail
+          GITHUB_ACTION_PATH="$PWD" DEPLOY_PAT="${{ secrets.ORG_DEPLOY_SECRET }}" \
+            bash .github/workflows/bin/setup-woorelease.sh
+
+      # woorelease checks out the .org SVN repo while staging, so svn must be installed (the real
+      # deploy gets it from the action's setup-svn.sh; ubuntu runners no longer ship it).
+      - name: "Dry-run deploy: set up Subversion"
+        if: ${{ inputs.simulate }}
+        run: bash .github/actions/woo-product-deploy/.github/workflows/bin/setup-svn.sh
+
+      - name: "Dry-run deploy: WordPress.org (build + stage, no commit)"
+        if: ${{ inputs.simulate }}
+        working-directory: plugin
+        run: |
+          set -euo pipefail
+          phar="../.github/actions/woo-product-deploy/woorelease.phar"
+          url="https://github.com/${{ github.repository }}/tree/release/${{ inputs.version }}"
+          php "$phar" wporg:release "$url" --folder="$PWD" --product_version="${{ inputs.version }}"
+
+      - name: "Dry-run deploy: upload package"
+        if: ${{ inputs.simulate }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: action-scheduler-${{ inputs.version }}-dryrun
+          path: plugin/action-scheduler.zip
+          if-no-files-found: error
 
       # After a successful real release, open a PR to bring the release branch (version bump,
       # changelog) back into trunk.
